@@ -25,6 +25,11 @@
 
 #include <opm/parser/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/parser/eclipse/EclipseState/Runspec.hpp>
+#include <opm/parser/eclipse/EclipseState/Tables/FlatTable.hpp> // PVTW
+#include <opm/parser/eclipse/EclipseState/Tables/PvdgTable.hpp>
+#include <opm/parser/eclipse/EclipseState/Tables/PvdoTable.hpp>
+#include <opm/parser/eclipse/EclipseState/Tables/PvtgTable.hpp>
+#include <opm/parser/eclipse/EclipseState/Tables/PvtoTable.hpp>
 #include <opm/parser/eclipse/EclipseState/Tables/SgfnTable.hpp>
 #include <opm/parser/eclipse/EclipseState/Tables/SgofTable.hpp>
 #include <opm/parser/eclipse/EclipseState/Tables/Sof2Table.hpp>
@@ -41,7 +46,97 @@
 #include <array>
 #include <cstddef>
 #include <iterator>
+#include <utility>
 #include <vector>
+
+namespace {
+    /// Create linearised, padded TAB vector entries for a collection of
+    /// tabulated saturation functions corresponding to a single input
+    /// keyword.
+    ///
+    /// \tparam BuildDependent Callable entity that extracts the
+    ///    independent and primary dependent variates of a single
+    ///    saturation function table into a linearised output table.
+    ///    Must implement a function call operator of the form
+    ///    \code
+    ///       std::size_t
+    ///       operator()(const std::size_t      tableID,
+    ///                  const std::size_t      primID,
+    ///                  LinearisedOutputTable& table);
+    ///    \endcode
+    ///    that will assign the independent variate of the sub-table
+    ///    primID within the table identified as tableID to column zero
+    ///    of 'table' and all dependent variates to columns one &c of
+    ///    'table'.  The function call operator must return the number
+    ///    of active (used) rows within the sub-table through its return
+    ///    value.
+    ///
+    /// \param[in] numTab Number of tables in this table collection.
+    ///
+    /// \param[in] numTab Number of primary look-up keys for each table.
+    ///    Mostly relevant (i.e., greater than one) for miscible oil
+    ///    ("PVTO") or miscible gas ("PVTG") tables and typically
+    ///    corresponds to the number of Rs/Rv entries from the TABDIMS
+    ///    keyword.
+    ///
+    /// \param[in] numRows Number of rows to allocate for each padded
+    ///    output table.
+    ///
+    /// \param[in] numDep Number of dependent variates (columns) in each
+    ///    table of this collection of input tables.  Total number of
+    ///    columns in the result vector will be 1 + 2*numDep to account
+    ///    for the independent variate, the dependent variates and the
+    ///    derivatives of the dependent variates with respect to the
+    ///    independent variate.
+    ///
+    /// \param[in] buildDeps Function object that implements the
+    ///    protocol outlined for \code BuildDependent::operator()()
+    ///    \endcode.  Typically a lambda expression.
+    ///
+    /// \return Linearised, padded TAB vector entries for a collection of
+    ///    tabulated property functions (e.g., saturation functions or PVT
+    ///    functions) corresponding to a single input keyword.  Derivatives
+    ///    included as additional columns.
+    template <class BuildDependent>
+    std::vector<double>
+    createPropfuncTable(const std::size_t numTab,
+                        const std::size_t numPrim,
+                        const std::size_t numRows,
+                        const std::size_t numDep,
+                        BuildDependent&&  buildDeps)
+    {
+        const auto numCols = 1 + 2*numDep;
+
+        auto descr = ::Opm::DifferentiateOutputTable::Descriptor{};
+        descr.primID = 0 * numPrim;
+
+        auto linTable = ::Opm::LinearisedOutputTable {
+            numTab, numPrim, numRows, numCols
+        };
+
+        for (descr.tableID = 0*numTab;
+             descr.tableID < 1*numTab; ++descr.tableID)
+        {
+            for (descr.primID = 0*numPrim;
+                 descr.primID < 1*numPrim; ++descr.primID)
+            {
+                descr.numActRows =
+                    buildDeps(descr.tableID, descr.primID, linTable);
+
+                // Derivatives.  Use values already stored in linTable to
+                // take advantage of any unit conversion already applied.
+                // We don't have to do anything special for the units here.
+                //
+                // Note: argument 'descr' implies argument-dependent lookup
+                //    whence we unambiguously invoke function calcSlopes()
+                //    from namespace ::Opm::DifferentiateOutputTable.
+                calcSlopes(numDep, descr, linTable);
+            }
+        }
+
+        return linTable.getDataDestructively();
+    }
+} // Anonymous
 
 /// Functions to facilitate generating TAB vector entries for tabulated
 /// saturation functions.
@@ -94,33 +189,12 @@ namespace { namespace SatFunc {
                            const std::size_t numDep,
                            BuildDependent&&  buildDeps)
         {
+            // Saturation functions do not have sub-tables so the number of
+            // primary look-up keys is one.
             const auto numPrim = std::size_t{1};
-            const auto numCols = 1 + 2*numDep;
 
-            auto descr = ::Opm::DifferentiateOutputTable::Descriptor{};
-            descr.primID = 0 * numPrim;
-
-            auto linTable = ::Opm::LinearisedOutputTable {
-                numTab, numPrim, numRows, numCols
-            };
-
-            for (descr.tableID = 0*numTab;
-                 descr.tableID < 1*numTab; ++descr.tableID)
-            {
-                descr.numActRows =
-                    buildDeps(descr.tableID, descr.primID, linTable);
-
-                // Derivatives.  Use values already stored in linTable to
-                // take advantage of any unit conversion already applied.
-                // We don't have to do anything special for the units here.
-                //
-                // Note: argument 'descr' implies argument-dependent lookup
-                //    whence we unambiguously invoke function calcSlopes()
-                //    from namespace ::Opm::DifferentiateOutputTable.
-                calcSlopes(numDep, descr, linTable);
-            }
-
-            return linTable.getDataDestructively();
+            return createPropfuncTable(numTab, numPrim, numRows, numDep,
+                                       std::forward<BuildDependent>(buildDeps));
         }
     } // detail
 
@@ -1005,6 +1079,181 @@ namespace { namespace SatFunc {
         }
     } // Water
 }} // Anonymous::SatFunc
+
+/// Functions to facilitate generating TAB vector entries for tabulated
+/// PVT functions.
+namespace { namespace PVTFunc {
+
+    /// Functions to create linearised, padded, and normalised gas output
+    /// tables from various input gas PVT function keywords.
+    namespace Gas {
+        std::vector<double>
+        fromPVDG(const std::size_t          numRows,
+                 const Opm::UnitSystem&     units,
+                 const Opm::TableContainer& pvdg)
+        {
+            // Columns [ Pg, 1/Bg, 1/(Bg*mu_g), derivatives ]
+            using PVDG = ::Opm::PvdgTable;
+
+            const auto numTab  = pvdg.size();
+            const auto numPrim = std::size_t{1}; // No sub-tables
+            const auto numDep  = std::size_t{2}; // 1/Bg, 1/(Bg*mu_g)
+
+            return createPropfuncTable(numTab, numPrim, numRows, numDep,
+                [&units, &pvdg](const std::size_t           tableID,
+                                const std::size_t           primID,
+                                Opm::LinearisedOutputTable& linTable)
+                -> std::size_t
+            {
+                const auto& t = pvdg.getTable<PVDG>(tableID);
+
+                auto numActRows = std::size_t{0};
+
+                // Column 0: Pg
+                {
+                    const auto uPress = ::Opm::UnitSystem::measure::pressure;
+
+                    const auto& Pg = t.getPressureColumn();
+
+                    numActRows = Pg.size();
+
+                    std::transform(std::begin(Pg), std::end(Pg),
+                                   linTable.column(tableID, primID, 0),
+                                   [&units, uPress](const double p) -> double
+                                   {
+                                       return units.from_si(uPress, p);
+                                   });
+                }
+
+                // Column 1: 1/Bg
+                {
+                    const auto uRecipFVF = ::Opm::UnitSystem::measure::
+                        gas_inverse_formation_volume_factor;
+
+                    const auto& Bg = t.getFormationFactorColumn();
+                    std::transform(std::begin(Bg), std::end(Bg),
+                                   linTable.column(tableID, primID, 1),
+                                   [&units, uRecipFVF](const double B) -> double
+                                   {
+                                       return units.from_si(uRecipFVF, 1.0 / B);
+                                   });
+                }
+
+                // Column 2: 1/(Bg*mu_g)
+                {
+                    const auto uRecipFVF = ::Opm::UnitSystem::measure::
+                        gas_inverse_formation_volume_factor;
+
+                    const auto uVisc = ::Opm::UnitSystem::measure::viscosity;
+
+                    const auto& Bg   = t.getFormationFactorColumn();
+                    const auto& mu_g = t.getViscosityColumn();
+
+                    std::transform(std::begin(Bg), std::end(Bg),
+                                   std::begin(mu_g),
+                                   linTable.column(tableID, primID, 2),
+                                   [&units, uRecipFVF, uVisc]
+                                   (const double B, const double mu) -> double
+                                   {
+                                       return units.from_si(uRecipFVF, 1.0 / B)
+                                           /  units.from_si(uVisc    , mu);
+                                   });
+                }
+
+                // Inform createPropfuncTable() of number of active rows in
+                // this table.  Needed to compute slopes of piecewise linear
+                // interpolants.
+                return numActRows;
+            });
+        }
+    } // Gas
+
+    namespace Oil {
+        std::vector<double>
+        fromPVDO(const std::size_t          numRows,
+                 const Opm::UnitSystem&     units,
+                 const Opm::TableContainer& pvdo)
+        {
+            // Columns [ Po, 1/Bo, 1/(Bo*mu_o), derivatives ]
+            using PVDO = ::Opm::PvdoTable;
+
+            const auto numTab  = pvdo.size();
+            const auto numPrim = std::size_t{1}; // No sub-tables
+            const auto numDep  = std::size_t{2}; // 1/Bo, 1/(Bo*mu_o)
+
+            return createPropfuncTable(numTab, numPrim, numRows, numDep,
+                [&units, &pvdo](const std::size_t           tableID,
+                                const std::size_t           primID,
+                                Opm::LinearisedOutputTable& linTable)
+                -> std::size_t
+            {
+                const auto& t = pvdo.getTable<PVDO>(tableID);
+
+                auto numActRows = std::size_t{0};
+
+                // Column 0: Po
+                {
+                    const auto uPress = ::Opm::UnitSystem::measure::pressure;
+
+                    const auto& Po = t.getPressureColumn();
+
+                    numActRows = Po.size();
+
+                    std::transform(std::begin(Po), std::end(Po),
+                                   linTable.column(tableID, primID, 0),
+                                   [&units, uPress](const double p) -> double
+                                   {
+                                       return units.from_si(uPress, p);
+                                   });
+                }
+
+                // Column 1: 1/Bo
+                {
+                    const auto uRecipFVF = ::Opm::UnitSystem::measure::
+                        oil_inverse_formation_volume_factor;
+
+                    const auto& Bo = t.getFormationFactorColumn();
+                    std::transform(std::begin(Bo), std::end(Bo),
+                                   linTable.column(tableID, primID, 1),
+                                   [&units, uRecipFVF](const double B) -> double
+                                   {
+                                       return units.from_si(uRecipFVF, 1.0 / B);
+                                   });
+                }
+
+                // Column 2: 1/(Bo*mu_o)
+                {
+                    const auto uRecipFVF = ::Opm::UnitSystem::measure::
+                        oil_inverse_formation_volume_factor;
+
+                    const auto uVisc = ::Opm::UnitSystem::measure::viscosity;
+
+                    const auto& Bo   = t.getFormationFactorColumn();
+                    const auto& mu_o = t.getViscosityColumn();
+
+                    std::transform(std::begin(Bo), std::end(Bo),
+                                   std::begin(mu_o),
+                                   linTable.column(tableID, primID, 2),
+                                   [&units, uRecipFVF, uVisc]
+                                   (const double B, const double mu) -> double
+                                   {
+                                       return units.from_si(uRecipFVF, 1.0 / B)
+                                           /  units.from_si(uVisc    , mu);
+                                   });
+                }
+
+                // Inform createPropfuncTable() of number of active rows in
+                // this table.  Needed to compute slopes of piecewise linear
+                // interpolants.
+                return numActRows;
+            });
+        }
+    } // Oil
+
+    namespace Water {
+    } // Water
+
+}} // Anonymous::PVTFunc
 
 namespace Opm {
 
